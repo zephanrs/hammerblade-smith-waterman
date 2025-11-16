@@ -1,0 +1,9 @@
+*
+
+!.gitignore
+!Makefile
+!kernel.cpp
+!main.cpp
+!app_path.mk
+!template.mk
+!tests.mk

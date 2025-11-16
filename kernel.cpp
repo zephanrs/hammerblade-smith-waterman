@@ -31,11 +31,12 @@ inline int max(int a, int b, int c, int d) {
   return max(max(a,b), max(c,d));
 }
 
+int dp[QRY_CORE+1][REF_CORE+1];
+uint8_t qrybuf[QRY_CORE];
+uint8_t refbuf[REF_CORE];
 int max_left = -1;
 int max_top  = -1;
 int maxv     = -1;
-
-int dp[QRY_CORE+1][REF_CORE+1];
 
 // Kernel main;
 extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
@@ -52,26 +53,35 @@ extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
 
   int tmp;
 
-  // wait for core above to write
-  tmp = bsg_lr(&max_top);
-  if (__bsg_y && (tmp == -1)) bsg_lr_aq(&max_top);
-  asm volatile("" ::: "memory");
+  if (!__bsg_y) {
+    // load reference
+    for (int i = 0; i < REF_CORE; i++) 
+      refbuf[i] = ref[(__bsg_x * REF_CORE) + i ];
+  } else {
+    // wait for core above to write
+    tmp = bsg_lr(&max_top);
+    if (__bsg_y && (tmp == -1)) bsg_lr_aq(&max_top);
+    asm volatile("" ::: "memory");
+  }
 
-  // wait for core to the left to write
-  tmp = bsg_lr(&max_left);
-  if (__bsg_x && (tmp == -1)) bsg_lr_aq(&max_left);
-  asm volatile("" ::: "memory");
-
+  if (!__bsg_x) {
+    // load query
+    for (int i = 0; i < QRY_CORE; i++) 
+      qrybuf[i] = qry[(__bsg_y * QRY_CORE) + i];
+  } else {
+    // wait for core to the left to write
+    tmp = bsg_lr(&max_left);
+    if (__bsg_x && (tmp == -1)) bsg_lr_aq(&max_left);
+    asm volatile("" ::: "memory");
+  }
+  
   // derive maximum value
   maxv = max(0, max_top, max_left);
   
   // do dp calculation
   for (int i = 1; i <= QRY_CORE; i++) {
     for (int j = 1; j <= REF_CORE; j++) {
-      int qi = (__bsg_y * QRY_CORE) + (i - 1);
-      int rj = (__bsg_x * REF_CORE) + (j - 1);
-
-      int match = (qry[qi] == ref[rj]) ? MATCH : MISMATCH;
+      int match = (qrybuf[i-1] == refbuf[j-1]) ? MATCH : MISMATCH;
 
       int score_diag = dp[i-1][j-1] + match;
       int score_up   = dp[i-1][j]   - GAP;
@@ -86,25 +96,35 @@ extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
   }
 
   int *ndp, *nmax;
+  uint8_t *nseq;
 
-  // copy data below
+  
   if (__bsg_y < (bsg_tiles_Y - 1)) {
+    // copy dp below
     ndp =  (int*) bsg_remote_ptr(__bsg_x, __bsg_y+1, &dp[0][0]);
-    for (int j = 0; j <= REF_CORE; j++) {
+    for (int j = 0; j <= REF_CORE; j++)
       ndp[j] = dp[QRY_CORE][j];
-    }
+
+    // copy reference below
+    nseq = (uint8_t*) bsg_remote_ptr(__bsg_x, __bsg_y+1, &refbuf);
+    for (int j = 0; j < REF_CORE; j++)
+      nseq[j] = refbuf[j];
 
     // activate bottom core (and transfer max)
     nmax =  (int*) bsg_remote_ptr(__bsg_x, __bsg_y+1, &max_top);
     *nmax = maxv;
   }
 
-  // copy data right
   if (__bsg_x < (bsg_tiles_X - 1)) {
+    // copy dp right
     ndp = (int*) bsg_remote_ptr(__bsg_x+1, __bsg_y, &dp[0][0]);
-    for (int j = 0; j <= QRY_CORE; j++) {
+    for (int j = 0; j <= QRY_CORE; j++)
       ndp[(REF_CORE+1)*j] = dp[j][REF_CORE];
-    }
+
+    // copy query below
+    nseq = (uint8_t*) bsg_remote_ptr(__bsg_x+1, __bsg_y, &qrybuf);
+    for (int j = 0; j < QRY_CORE; j++)
+      nseq[j] = qrybuf[j];
 
     // activate right core (and transfer max)
     nmax =  (int*) bsg_remote_ptr(__bsg_x+1, __bsg_y, &max_left);

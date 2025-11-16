@@ -57,18 +57,22 @@ extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
     // load reference
     for (int i = 0; i < REF_CORE; i++) 
       refbuf[i] = ref[(__bsg_x * REF_CORE) + i ];
-  } else {
-    // wait for core above to write
-    tmp = bsg_lr(&max_top);
-    if (__bsg_y && (tmp == -1)) bsg_lr_aq(&max_top);
-    asm volatile("" ::: "memory");
   }
 
   if (!__bsg_x) {
     // load query
     for (int i = 0; i < QRY_CORE; i++) 
       qrybuf[i] = qry[(__bsg_y * QRY_CORE) + i];
-  } else {
+  }
+  
+  if (__bsg_y) {
+    // wait for core above to write
+    tmp = bsg_lr(&max_top);
+    if (__bsg_y && (tmp == -1)) bsg_lr_aq(&max_top);
+    asm volatile("" ::: "memory");
+  }
+
+  if (__bsg_x) {
     // wait for core to the left to write
     tmp = bsg_lr(&max_left);
     if (__bsg_x && (tmp == -1)) bsg_lr_aq(&max_left);

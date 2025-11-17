@@ -2,7 +2,7 @@
 
 template<int N>
 static inline __attribute__((always_inline))
-void unrolled_copy(uint8_t* __restrict dst,
+void unrolled_load(uint8_t* __restrict dst,
                    const uint8_t* __restrict src)
 {
   // N >= 16 (hide latency)

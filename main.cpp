@@ -27,20 +27,6 @@ void read_seq(const char* filename, uint8_t* seq, int num_seq) {
   fclose(file);
 }
 
-
-void read_output(const char* filename, int* output, int num_seq)
-{
-  FILE* file = fopen(filename, "r");
-  for (int i = 0; i < num_seq; i++) {
-    int score;
-    fscanf(file, "%d", &score);
-    output[i] = score;
-  } 
-  fclose(file);
-}
-
-
-
 // Host main;
 int sw_multipod(int argc, char ** argv) {
   int r = 0;
@@ -49,22 +35,19 @@ int sw_multipod(int argc, char ** argv) {
   const char *bin_path = argv[1];
   const char *query_path = argv[2];
   const char *ref_path = argv[3];
-  const char *output_path = argv[4];
 
   // parameters;
-  int num_seq = NUM_SEQ;//NUM_SEQ; // per pod;
-  int seq_len = 32;
+  int num_seq = NUM_SEQ; // per pod;
+  int seq_len = SEQ_LEN;
   printf("num_seq=%d\n", num_seq);
   printf("seq_len=%d\n", seq_len);
   
   // prepare inputs;
-  uint8_t* query = (uint8_t*) malloc(num_seq*(seq_len+1)*sizeof(uint8_t));
-  uint8_t* ref = (uint8_t*) malloc(num_seq*(seq_len+1)*sizeof(uint8_t));
-  int* output = (int*) malloc(num_seq*sizeof(int));
-  read_seq(query_path, query, num_seq);
-  read_seq(ref_path, ref, num_seq);
-  read_output(output_path, output, num_seq);
-
+  uint8_t* query = (uint8_t*) malloc(num_seq*seq_len*sizeof(uint8_t));
+  uint8_t* ref = (uint8_t*) malloc(num_seq*seq_len*sizeof(uint8_t));
+  // hacky way to get longer sequences:
+  read_seq(query_path, query, num_seq * (seq_len / 32));
+  read_seq(ref_path, ref, num_seq * (seq_len / 32));
  
   // initialize device; 
   hb_mc_device_t device;
@@ -131,15 +114,15 @@ int sw_multipod(int argc, char ** argv) {
     dtoh_job.push_back({d_output, actual_output, num_seq*sizeof(int)});
     BSG_CUDA_CALL(hb_mc_device_transfer_data_to_host(&device, dtoh_job.data(), dtoh_job.size()));
 
-    int H[33][33];
+    int H[seq_len+1][seq_len+1];
     int m[num_seq];
     int mj = 0, mk=0;
     for (int i = 0; i < num_seq; i++) {
       memset(H, 0, sizeof(H));
       m[i] = 0;
-      for (int j = 0; j < 32; j++) {
-        for (int k = 0; k < 32; k++) {
-          int match = (query[32*i+j] == ref[32*i+k]) ? 1 : -1;
+      for (int j = 0; j < seq_len; j++) {
+        for (int k = 0; k < seq_len; k++) {
+          int match = (query[seq_len*i+j] == ref[seq_len*i+k]) ? 1 : -1;
           int score_diag = H[j][k] + match;
           int score_up = H[j][k+1] - 1;
           int score_left = H[j+1][k] - 1;

@@ -4,28 +4,20 @@
 #include "unroll.hpp"
 #include <cstdint>
 
-// flags
-#define SEQUENCES  8
-#define SEQ_LENGTH 32
-
-#define QRY_CORE (SEQ_LENGTH / bsg_tiles_Y)
-#define REF_CORE (SEQ_LENGTH / bsg_tiles_X)
-
 // parameters
+#define QRY_CORE (SEQ_LEN / bsg_tiles_Y)
+#define REF_CORE (SEQ_LEN / bsg_tiles_X)
+
 #define NUM_TILES (bsg_tiles_X*bsg_tiles_Y)
 #define MATCH     1
 #define MISMATCH -1
 #define GAP       1
 
-// default buffer values
+// default buffer values 
 #define BUFFER { .right_rdy = 1, .bottom_rdy = 1, .max_left = -1, .max_top = -1 }
 
-
 inline int max(int a, int b) {
-  if (a > b) {
-    return a;
-  }
-  return b;
+  return (a > b) ? a : b;
 }
 
 inline int max(int a, int b, int c) {
@@ -36,20 +28,16 @@ inline int max(int a, int b, int c, int d) {
   return max(max(a,b), max(c,d));
 }
 
-
-typedef struct {
-  // dp matrix and reference/query
+struct buffer_t {
   int      dp[QRY_CORE+1][REF_CORE+1];
   uint8_t  qrybuf[QRY_CORE];
   uint8_t  refbuf[REF_CORE];
 
-  // valid/ready signals and max value
-  int right_rdy;
-  int bottom_rdy;
-  int max_left;
-  int max_top;
+  int right_rdy  =  1;
+  int bottom_rdy =  1;
+  int max_left   = -1;
+  int max_top    = -1;
 
-  // remote pointers
   int      *left_rdy;
   int      *top_rdy;
   int      *right_dp;
@@ -58,8 +46,9 @@ typedef struct {
   int      *bottom_max;
   uint8_t  *next_qry;
   uint8_t  *next_ref;
-} buffer_t;
+};
 
+// initialize remote pointers
 static void init_buffer(buffer_t *b, int x, int y) {
   b->left_rdy   = (int *)     bsg_remote_ptr(x - 1, y, &b->right_rdy );
   b->top_rdy    = (int *)     bsg_remote_ptr(x, y - 1, &b->bottom_rdy);
@@ -86,14 +75,14 @@ extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
   init_buffer(&buffers[0], __bsg_x, __bsg_y);
   init_buffer(&buffers[1], __bsg_x, __bsg_y);
 
-  for (int i = 0; i < SEQUENCES; i++) {
+  for (int i = 0; i < NUM_SEQ; i++) {
     curr = &buffers[i & 0x1];
 
     if (!__bsg_y) {
       // load reference
       unrolled_load<REF_CORE>(
         curr->refbuf,
-        &ref[SEQ_LENGTH * i + (__bsg_x * REF_CORE)]
+        &ref[SEQ_LEN * i + (__bsg_x * REF_CORE)]
       );
     }
 
@@ -101,7 +90,7 @@ extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
       // load query
       unrolled_load<QRY_CORE>(
         curr->qrybuf,
-        &qry[SEQ_LENGTH * i + (__bsg_y * QRY_CORE)]
+        &qry[SEQ_LEN * i + (__bsg_y * QRY_CORE)]
       );
     }
     

@@ -3,6 +3,7 @@
 !.gitignore
 !Makefile
 !kernel.cpp
+!unroll.hpp
 !main.cpp
 !app_path.mk
 !template.mk

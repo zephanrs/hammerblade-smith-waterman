@@ -1,6 +1,7 @@
 #include <bsg_manycore.h>
 #include <bsg_cuda_lite_barrier.h>
 #include "bsg_barrier_multipod.h"
+#include "unroll.hpp"
 #include <cstdint>
 
 // flags
@@ -90,14 +91,18 @@ extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
 
     if (!__bsg_y) {
       // load reference
-      for (int j = 0; j < REF_CORE; j++) 
-        curr->refbuf[j] = ref[SEQ_LENGTH * i + (__bsg_x * REF_CORE) + j ];
+      unrolled_load<REF_CORE>(
+        curr->refbuf,
+        &ref[SEQ_LENGTH * i + (__bsg_x * REF_CORE)]
+      );
     }
 
     if (!__bsg_x) {
       // load query
-      for (int k = 0; k < QRY_CORE; k++) 
-        curr->qrybuf[k] = qry[SEQ_LENGTH * i + (__bsg_y * QRY_CORE) + k];
+      unrolled_load<QRY_CORE>(
+        curr->qrybuf,
+        &qry[SEQ_LENGTH * i + (__bsg_y * QRY_CORE)]
+      );
     }
     
     if (__bsg_y) {
@@ -189,7 +194,6 @@ extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
     // write result
     if ((__bsg_x == (bsg_tiles_X - 1)) && (__bsg_y == (bsg_tiles_Y - 1)))
       output[i] = maxv;
-    
   }
   
   // kernel end;

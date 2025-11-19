@@ -14,7 +14,7 @@
 #define GAP       1
 
 // default buffer values 
-#define BUFFER { .right_rdy = 1, .bottom_rdy = 1, .max_left = -1, .max_top = -1 }
+#define BUFFER { .right_done = 1, .bottom_done = 1, .max_left = -1, .max_top = -1 }
 
 inline int max(int a, int b) {
   return (a > b) ? a : b;
@@ -33,15 +33,15 @@ struct buffer_t {
   uint8_t  qrybuf[QRY_CORE];
   uint8_t  refbuf[REF_CORE];
 
-  int right_rdy  =  1;
-  int bottom_rdy =  1;
+  int right_done  =  1;
+  int bottom_done =  1;
   int max_left   = -1;
   int max_top    = -1;
 
-  int      *left_rdy;
-  int      *top_rdy;
-  int      *right_dp;
-  int      *bottom_dp;
+  int      *left_done;
+  int      *top_done;
+  int      *left_dp;
+  int      *top_dp;
   int      *right_max;
   int      *bottom_max;
   uint8_t  *next_qry;
@@ -50,14 +50,14 @@ struct buffer_t {
 
 // initialize remote pointers
 static void init_buffer(buffer_t *b, int x, int y) {
-  b->left_rdy   = (int *)     bsg_remote_ptr(x - 1, y, &b->right_rdy );
-  b->top_rdy    = (int *)     bsg_remote_ptr(x, y - 1, &b->bottom_rdy);
-  b->right_dp   = (int *)     bsg_remote_ptr(x + 1, y, &b->dp[0][0]  );
-  b->bottom_dp  = (int *)     bsg_remote_ptr(x, y + 1, &b->dp[0][0]  );
-  b->right_max  = (int *)     bsg_remote_ptr(x + 1, y, &b->max_left  );
-  b->bottom_max = (int *)     bsg_remote_ptr(x, y + 1, &b->max_top   );
-  b->next_qry   = (uint8_t *) bsg_remote_ptr(x + 1, y, &b->qrybuf[0] );
-  b->next_ref   = (uint8_t *) bsg_remote_ptr(x, y + 1, &b->refbuf[0] );
+  b->left_done  = (int *)     bsg_remote_ptr(x - 1, y, &b->right_done  );
+  b->top_done   = (int *)     bsg_remote_ptr(x, y - 1, &b->bottom_done );
+  b->left_dp    = (int *)     bsg_remote_ptr(x - 1, y, &b->dp[0][0]    );
+  b->top_dp     = (int *)     bsg_remote_ptr(x, y - 1, &b->dp[0][0]    );
+  b->right_max  = (int *)     bsg_remote_ptr(x + 1, y, &b->max_left    );
+  b->bottom_max = (int *)     bsg_remote_ptr(x, y + 1, &b->max_top     );
+  b->next_qry   = (uint8_t *) bsg_remote_ptr(x - 1, y, &b->qrybuf[0]   );
+  b->next_ref   = (uint8_t *) bsg_remote_ptr(x, y - 1, &b->refbuf[0]   );
 }
 
 static buffer_t buffers[2] = { BUFFER, BUFFER };
@@ -78,20 +78,57 @@ extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
   for (int i = 0; i < NUM_SEQ; i++) {
     curr = &buffers[i & 0x1];
 
+    // ensure buffers are ready
+    int rdy = bsg_lr(&(curr->right_done));
+    if (!rdy) bsg_lr_aq(&(curr->right_done));
+    asm volatile("" ::: "memory");
+
+    rdy = bsg_lr(&(curr->bottom_done));
+    if (!rdy) bsg_lr_aq(&(curr->bottom_done));
+    asm volatile("" ::: "memory");
+
+    if (!__bsg_x) {
+      // load query
+      unrolled_load<uint8_t, QRY_CORE>(
+        curr->qrybuf,
+        &qry[SEQ_LEN * i + (__bsg_y * QRY_CORE)]
+      );
+    }
+
     if (!__bsg_y) {
       // load reference
-      unrolled_load<REF_CORE>(
+      unrolled_load<uint8_t, REF_CORE>(
         curr->refbuf,
         &ref[SEQ_LEN * i + (__bsg_x * REF_CORE)]
       );
     }
 
-    if (!__bsg_x) {
-      // load query
-      unrolled_load<QRY_CORE>(
+    int maxv = 0;
+
+    if (__bsg_x) {
+      // wait for core to the left to write
+      int rdy = bsg_lr(&(curr->max_left));
+      if (rdy == -1) bsg_lr_aq(&(curr->max_left));
+      asm volatile("" ::: "memory");
+
+      // update maximum value
+      maxv = max(maxv, curr->max_left);
+      curr->max_left = -1;
+
+      // copy over query
+      unrolled_load<uint8_t, QRY_CORE>(
         curr->qrybuf,
-        &qry[SEQ_LEN * i + (__bsg_y * QRY_CORE)]
+        curr->next_qry
       );
+
+      // copy over dp table
+      unrolled_load<int, QRY_CORE+1, REF_CORE+1>(
+        &(curr->dp[0][0]),
+        &(curr->left_dp[REF_CORE])
+      );
+
+      // indicate we are done with the buffer
+      *(curr->left_done) = 1;
     }
     
     if (__bsg_y) {
@@ -99,17 +136,26 @@ extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
       int rdy = bsg_lr(&(curr->max_top));
       if (rdy == -1) bsg_lr_aq(&(curr->max_top));
       asm volatile("" ::: "memory");
-    }
 
-    if (__bsg_x) {
-      // wait for core to the left to write
-      int rdy = bsg_lr(&(curr->max_left));
-      if (rdy == -1) bsg_lr_aq(&(curr->max_left));
-      asm volatile("" ::: "memory");
+      // update maximum value
+      maxv = max(maxv, curr->max_top);
+      curr->max_top = -1;
+
+      // copy over reference
+      unrolled_load<uint8_t, REF_CORE>(
+        curr->refbuf,
+        curr->next_ref
+      );
+
+      // copy over dp table
+      unrolled_load<int, REF_CORE+1>(
+        &(curr->dp[0][0]),
+        &(curr->top_dp[QRY_CORE * (REF_CORE + 1)])
+      );
+
+      // indicate we are done with the buffer
+      *(curr->top_done) = 1;
     }
-    
-    // derive maximum value
-    int maxv = max(0, curr->max_top, curr->max_left);
     
     // do dp calculation
     for (int j = 1; j <= QRY_CORE; j++) {
@@ -130,55 +176,17 @@ extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
       }
     }
     
-    if (__bsg_y < (bsg_tiles_Y - 1)) {
-      // ensure bottom core is ready to receive
-      int rdy = bsg_lr(&(curr->bottom_rdy));
-      if (!rdy) bsg_lr_aq(&(curr->bottom_rdy));
-      asm volatile("" ::: "memory");
-
-      // copy dp below
-      for (int j = 0; j <= REF_CORE; j++)
-        curr->bottom_dp[j] = curr->dp[QRY_CORE][j];
-
-      // copy reference below
-      for (int j = 0; j < REF_CORE; j++)
-        curr->next_ref[j] = curr->refbuf[j];
-
-      // activate bottom core (and transfer max)
-      *(curr->bottom_max) = maxv;
-
-      // indicate buffer is in-use
-      curr->bottom_rdy = 0;
-    }
-
     if (__bsg_x < (bsg_tiles_X - 1)) {
-      // ensure right core is ready to receive
-      int rdy = bsg_lr(&(curr->right_rdy));
-      if (!rdy) bsg_lr_aq(&(curr->right_rdy));
-      asm volatile("" ::: "memory");
-
-      // copy dp right
-      for (int j = 0; j <= QRY_CORE; j++)
-        curr->right_dp[(REF_CORE+1)*j] = curr->dp[j][REF_CORE];
-
-      // copy query below
-      for (int j = 0; j < QRY_CORE; j++)
-        curr->next_qry[j] = curr->qrybuf[j];
-
       // activate right core (and transfer max)
       *(curr->right_max) = maxv;
-
-      // indicate buffer is in-use
-      curr->right_rdy = 0;
+      curr->right_done   = 0;
     }
 
-    // invalidate buffer
-    curr->max_left = -1;
-    curr->max_top  = -1;
-
-    // indicate buffer is free
-    if (__bsg_x) *(curr->left_rdy) = 1;
-    if (__bsg_y) *(curr->top_rdy)  = 1;
+    if (__bsg_y < (bsg_tiles_Y - 1)) {
+      // activate bottom core (and transfer max)
+      *(curr->bottom_max) = maxv;
+      curr->bottom_done   = 0;
+    }
 
     // write result
     if ((__bsg_x == (bsg_tiles_X - 1)) && (__bsg_y == (bsg_tiles_Y - 1)))

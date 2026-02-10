@@ -1,6 +1,6 @@
 .PHONY: all
 all: generate
-
+HB_HAMMERBENCH_PATH:=/home/zephans/bsg_bladerunner/bsg_replicant/examples/hb_hammerbench
 
 # test name
 test-name = seq-len_$(1)__num-seq_$(2)

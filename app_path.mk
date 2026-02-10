@@ -1,1 +1,1 @@
-APP_PATH = /work/global/zrs29/hb_source/sw
+APP_PATH = $(HB_HAMMERBENCH_PATH)/apps/sw

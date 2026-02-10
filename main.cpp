@@ -5,6 +5,7 @@
 #include <cstring>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
 #include <cstdio>
 #include <bsg_manycore_regression.h>
 #include <bsg_manycore.h>
@@ -92,7 +93,15 @@ int sw_multipod(int argc, char ** argv) {
   // Launch pod;
   printf("Launching all pods\n");
   hb_mc_manycore_trace_enable((&device)->mc);
+  struct timeval t0, t1;
+  gettimeofday(&t0, NULL);
   BSG_CUDA_CALL(hb_mc_device_pods_kernels_execute(&device));
+  gettimeofday(&t1, NULL);
+
+  double elapsed_us =
+    (t1.tv_sec  - t0.tv_sec) * 1e6 +
+    (t1.tv_usec - t0.tv_usec);
+
   hb_mc_manycore_trace_disable((&device)->mc);
 
 
@@ -148,6 +157,7 @@ int sw_multipod(int argc, char ** argv) {
     }
   }
 
+  printf("Kernel time: %.0f us\n", elapsed_us);
 
   // Finish;
   BSG_CUDA_CALL(hb_mc_device_finish(&device));

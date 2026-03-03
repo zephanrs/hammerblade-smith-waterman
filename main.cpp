@@ -48,6 +48,17 @@ int sw_multipod(int argc, char ** argv) {
   // hacky way to get longer sequences:
   read_seq(query_path, query, num_seq * (seq_len / 32));
   read_seq(ref_path, ref, num_seq * (seq_len / 32));
+
+  // per-sequence lengths (uniform for now);
+  int* qry_lens = (int*) malloc(num_seq*sizeof(int));
+  int* ref_lens = (int*) malloc(num_seq*sizeof(int));
+  for (int i = 0; i < num_seq; i++) {
+    qry_lens[i] = seq_len;
+    ref_lens[i] = seq_len;
+  }
+
+  // atomic sequence counter (shared across groups);
+  int seq_counter_init = 0;
  
   // initialize device; 
   hb_mc_device_t device;
@@ -55,6 +66,9 @@ int sw_multipod(int argc, char ** argv) {
 
   eva_t d_query;
   eva_t d_ref;
+  eva_t d_qry_lens;
+  eva_t d_ref_lens;
+  eva_t d_seq_counter;
   eva_t d_output;
 
   hb_mc_pod_id_t pod;
@@ -67,6 +81,9 @@ int sw_multipod(int argc, char ** argv) {
     // Allocate memory on device;
     BSG_CUDA_CALL(hb_mc_device_malloc(&device, num_seq*(seq_len+1)*sizeof(uint8_t), &d_query));
     BSG_CUDA_CALL(hb_mc_device_malloc(&device, num_seq*(seq_len+1)*sizeof(uint8_t), &d_ref));
+    BSG_CUDA_CALL(hb_mc_device_malloc(&device, num_seq*sizeof(int), &d_qry_lens));
+    BSG_CUDA_CALL(hb_mc_device_malloc(&device, num_seq*sizeof(int), &d_ref_lens));
+    BSG_CUDA_CALL(hb_mc_device_malloc(&device, sizeof(int), &d_seq_counter));
     BSG_CUDA_CALL(hb_mc_device_malloc(&device, num_seq*sizeof(int), &d_output));
    
     // DMA transfer;
@@ -74,13 +91,21 @@ int sw_multipod(int argc, char ** argv) {
     std::vector<hb_mc_dma_htod_t> htod_job;
     htod_job.push_back({d_query, query, num_seq*seq_len*sizeof(uint8_t)});
     htod_job.push_back({d_ref, ref, num_seq*seq_len*sizeof(uint8_t)});
+    htod_job.push_back({d_qry_lens, qry_lens, num_seq*sizeof(int)});
+    htod_job.push_back({d_ref_lens, ref_lens, num_seq*sizeof(int)});
+    htod_job.push_back({d_seq_counter, &seq_counter_init, sizeof(int)});
     BSG_CUDA_CALL(hb_mc_device_transfer_data_to_device(&device, htod_job.data(), htod_job.size()));
 
     // Cuda args;
     hb_mc_dimension_t tg_dim = { .x = bsg_tiles_X, .y = bsg_tiles_Y};
     hb_mc_dimension_t grid_dim = { .x = 1, .y = 1};
-    #define CUDA_ARGC 4
-    uint32_t cuda_argv[CUDA_ARGC] = {d_query, d_ref, d_output, pod};
+    #define CUDA_ARGC 8
+    uint32_t cuda_argv[CUDA_ARGC] = {
+      d_query, d_ref,
+      d_qry_lens, d_ref_lens,
+      d_seq_counter, (uint32_t)num_seq,
+      d_output, (uint32_t)pod
+    };
 
 
     // Enqueue kernel;
@@ -120,8 +145,8 @@ int sw_multipod(int argc, char ** argv) {
     for (int i = 0; i < num_seq; i++) {
       memset(H, 0, sizeof(H));
       m[i] = 0;
-      for (int j = 0; j < seq_len; j++) {
-        for (int k = 0; k < seq_len; k++) {
+      for (int j = 0; j < qry_lens[i]; j++) {
+        for (int k = 0; k < ref_lens[i]; k++) {
           int match = (query[seq_len*i+j] == ref[seq_len*i+k]) ? 1 : -1;
           int score_diag = H[j][k] + match;
           int score_up = H[j][k+1] - 1;
@@ -151,6 +176,8 @@ int sw_multipod(int argc, char ** argv) {
 
   // Finish;
   BSG_CUDA_CALL(hb_mc_device_finish(&device));
+  free(qry_lens);
+  free(ref_lens);
   if (fail) {
     return HB_MC_FAIL;
   } else {

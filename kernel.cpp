@@ -4,31 +4,13 @@
 #include "unroll.hpp"
 #include <cstdint>
 
-// Options for parallelization
-#ifndef PARALLELIZE_ROWS
-#ifndef PARALLELIZE_COLS
-#define PARALLELIZE_COLS
-#endif
-#endif
-
-#ifdef PARALLELIZE_COLS
 #define GROUP_ID __bsg_x
 #define NUM_GROUPS bsg_tiles_X
 #define CORE_ID __bsg_y
 #define CORES_PER_GROUP bsg_tiles_Y
-#else
-#define GROUP_ID __bsg_y
-#define NUM_GROUPS bsg_tiles_Y
-#define CORE_ID __bsg_x
-#define CORES_PER_GROUP bsg_tiles_X
-#endif
-
-#ifndef PREFETCH
-#define PREFETCH 0
-#endif
 
 // parameters
-#define REF_CORE (SEQ_LEN / CORES_PER_GROUP)
+#define MAX_REF_CORE (MAX_SEQ_LEN / CORES_PER_GROUP)
 #define NUM_TILES (bsg_tiles_X*bsg_tiles_Y)
 #define MATCH     1
 #define MISMATCH -1
@@ -46,6 +28,18 @@ inline int max(int a, int b, int c, int d) {
   return max(max(a,b), max(c,d));
 }
 
+// sequence info (double-buffered)
+// qry_len: 0 = empty, -1 = stop, >0 = valid
+struct seq_info_t {
+  int qry_len;
+  int ref_len;
+  int seq_id;
+};
+
+seq_info_t info_curr = {0, 0, 0};
+seq_info_t info_next = {0, 0, 0};
+
+// inter-core mailbox
 struct mailbox_t {
   int      dp_val;
   volatile int full;
@@ -58,61 +52,96 @@ mailbox_t mailbox = {0, 0, 0, 0};
 volatile int next_is_ready = 1;
 
 // global buffers
-uint8_t refbuf[REF_CORE + 1];
-int H1[REF_CORE + 1];
-int H2[REF_CORE + 1];
+uint8_t refbuf[MAX_REF_CORE + 1];
+int H1[MAX_REF_CORE + 1];
+int H2[MAX_REF_CORE + 1];
 
 // Kernel main;
-extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
+extern "C" int kernel(
+  uint8_t* qry, uint8_t* ref,
+  int* qry_lens, int* ref_lens,
+  int* seq_counter, int num_seq,
+  int* output, int pod_id)
 {
   bsg_barrier_tile_group_init();
   bsg_barrier_tile_group_sync();
   bsg_cuda_print_stat_kernel_start();
 
-#ifdef PARALLELIZE_COLS
+  // remote pointers
   mailbox_t *next_mailbox = (mailbox_t *)bsg_remote_ptr(__bsg_x, __bsg_y + 1, &mailbox);
   volatile int *prev_next_is_ready = (volatile int *)bsg_remote_ptr(__bsg_x, __bsg_y - 1, (void*)&next_is_ready);
-#else
-  mailbox_t *next_mailbox = (mailbox_t *)bsg_remote_ptr(__bsg_x + 1, __bsg_y, &mailbox);
-  volatile int *prev_next_is_ready = (volatile int *)bsg_remote_ptr(__bsg_x - 1, __bsg_y, (void*)&next_is_ready);
-#endif
 
-  // Each group processes a set of sequences
-  for (int s = GROUP_ID; s < NUM_SEQ; s += NUM_GROUPS) {
-    
+  // remote pointer for forwarding seq info to next core
+  seq_info_t *next_info = (seq_info_t *)bsg_remote_ptr(__bsg_x, __bsg_y + 1, &info_next);
+
+  // main loop
+  while (1) {
+
+    if (CORE_ID == 0) {
+      // atomically grab next sequence
+      int s;
+      asm volatile("amoadd.w %0, %1, (%2)"
+        : "=r"(s) : "r"(1), "r"(seq_counter) : "memory");
+      if (s >= num_seq) {
+        info_curr.qry_len = -1;
+      } else {
+        info_curr.seq_id  = s;
+        info_curr.ref_len = ref_lens[s];
+        info_curr.qry_len = qry_lens[s];
+      }
+    } else {
+      // wait for previous core to forward seq info
+      int rdy = bsg_lr((int*)&(info_next.qry_len));
+      if (rdy == 0) bsg_lr_aq((int*)&(info_next.qry_len));
+      asm volatile("" ::: "memory");
+
+      info_curr = info_next;
+      info_next.qry_len = 0;
+    }
+
+    // forward to next core
+    if (CORE_ID < CORES_PER_GROUP - 1) {
+      next_info->seq_id  = info_curr.seq_id;
+      next_info->ref_len = info_curr.ref_len;
+      asm volatile("" ::: "memory");
+      next_info->qry_len = info_curr.qry_len; // write last
+    }
+
+    // check for stop
+    if (info_curr.qry_len < 0) break;
+
+    // compute ref_core for this sequence
+    int s        = info_curr.seq_id;
+    int qry_len  = info_curr.qry_len;
+    int ref_len  = info_curr.ref_len;
+    int ref_core = ref_len / CORES_PER_GROUP;
+
     // DP row buffers
     int *H_curr = H1;
     int *H_prev = H2;
 
-    for (int k = 0; k <= REF_CORE; k++) {
+    for (int k = 0; k <= ref_core; k++) {
       H_prev[k] = 0;
     }
-    
+
     int maxv = 0;
 
-    // load reference chunk
-    unrolled_load<uint8_t, REF_CORE>(
-      &refbuf[1],
-      &ref[SEQ_LEN * s + (CORE_ID * REF_CORE)]
-    );
+    // load reference chunk (batches of 8, then rest)
+    uint8_t *ref_src = &ref[ref_len * s + (CORE_ID * ref_core)];
+    int k = 0;
+    for (; k + 8 <= ref_core; k += 8) {
+      unrolled_load<uint8_t, 8>(&refbuf[k + 1], &ref_src[k]);
+    }
+    for (; k < ref_core; k++) {
+      refbuf[k + 1] = ref_src[k];
+    }
 
     // do dp calculation row by row
-#if PREFETCH
-    register uint8_t next_qry asm("s4");
-    if (CORE_ID == 0 && SEQ_LEN > 0) {
-      next_qry = qry[SEQ_LEN * s];
-    }
-#endif
-
-    for (int i = 0; i < SEQ_LEN; i++) {
+    for (int i = 0; i < qry_len; i++) {
       uint8_t qry_char;
 
       if (CORE_ID == 0) {
-#if PREFETCH
-        qry_char = next_qry;
-#else
-        qry_char = qry[SEQ_LEN * s + i];
-#endif
+        qry_char = qry[qry_len * s + i];
         H_curr[0] = 0;
       } else {
         // wait for core to the left to write
@@ -128,11 +157,12 @@ extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
         }
 
         // indicate we are done with the buffer
+        asm volatile("" ::: "memory");
         mailbox.full = 0;
         *prev_next_is_ready = 1;
       }
 
-      for (int k = 1; k <= REF_CORE; k++) {
+      for (int k = 1; k <= ref_core; k++) {
         int match      = (qry_char == refbuf[k]) ? MATCH : MISMATCH;
 
         int score_diag = H_prev[k-1] + match;
@@ -155,9 +185,10 @@ extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
 
         next_is_ready = 0;
 
-        next_mailbox->dp_val = H_curr[REF_CORE];
+        next_mailbox->dp_val = H_curr[ref_core];
         next_mailbox->max_val = maxv;
         next_mailbox->qry_char = qry_char;
+        asm volatile("" ::: "memory");
         next_mailbox->full = 1;
       }
 
@@ -165,13 +196,6 @@ extern "C" int kernel(uint8_t* qry, uint8_t* ref, int* output, int pod_id)
       int *tmp = H_curr;
       H_curr = H_prev;
       H_prev = tmp;
-
-#if PREFETCH
-      if (CORE_ID == 0 && i < SEQ_LEN - 1) {
-        // prefetch next query char
-        next_qry = qry[SEQ_LEN * s + i + 1];
-      }
-#endif
     }
 
     if (CORE_ID == CORES_PER_GROUP - 1) {
